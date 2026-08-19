@@ -1,0 +1,52 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+.venv/
+*.egg-info/
+__pycache__/
+*.py[cod]
+.coverage
+.coverage.*
+.hypothesis/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+htmlcov/
+build/
+dist/
+
+# Local CairnVM state can contain plaintext guest data or credentials.
+/.cairnvm/
+/state/
+/secrets/
+**/.cairnvm/
+
+# Common root-level credential exports. Reviewed public anchors, security source,
+# and synthetic fixtures under named source/test directories remain trackable.
+/client_secret*.json
+/credentials*.json
+/oauth*.json
+/token*.json
+/*refresh_token*
+/*.pem
+/*.key
+/*.p12
+/*.pfx
+/*.jks
+/*.keystore
+/id_rsa
+/id_ed25519
+
+# Guest disks and exported virtual-machine images.
+*.qcow
+*.qcow2
+*.raw
+*.img
+*.vdi
+*.vmdk
+*.vhd
+*.vhdx
+*.ova
+*.ovf
+*.log

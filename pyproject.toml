@@ -1,0 +1,90 @@
+[build-system]
+requires = ["hatchling==1.32.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cairnvm-runtime"
+dynamic = ["version"]
+description = "Runtime foundation for the CairnVM persistent virtual disk"
+readme = "packages/runtime/README.md"
+requires-python = ">=3.11"
+license = "LicenseRef-Proprietary"
+license-files = ["LICENSE"]
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/baxter-barlow/cairnvm"
+Documentation = "https://github.com/baxter-barlow/cairnvm/blob/main/Docs/Architecture-Spec.md"
+Security = "https://github.com/baxter-barlow/cairnvm/security/policy"
+
+[project.scripts]
+cairnvm = "cairnvm.cli:main"
+
+[dependency-groups]
+build-backend = ["hatchling==1.32.0"]
+dev = [
+  { include-group = "build-backend" },
+  "build>=1.3,<2",
+  "check-wheel-contents>=0.6.3,<0.7",
+  "hypothesis>=6.137,<7",
+  "mypy>=1.17,<2",
+  "packaging>=25,<27",
+  "pre-commit>=4.3,<5",
+  "pytest>=8.4,<10",
+  "pytest-cov>=6.2,<8",
+  "pytest-timeout>=2.4,<3",
+  "ruff>=0.12,<0.16",
+]
+security = ["pip-audit>=2.9,<3"]
+
+[tool.hatch.version]
+path = "src/cairnvm/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cairnvm"]
+
+[tool.hatch.build.targets.sdist]
+include = ["/src/cairnvm", "/packages/runtime/README.md", "/LICENSE", "/pyproject.toml"]
+
+[tool.uv]
+required-version = ">=0.10.4,<0.11"
+
+[tool.uv.workspace]
+members = ["packages/launcher"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "PTH", "RUF", "S", "SIM", "UP"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S101"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["src", "packages/launcher/src", "scripts", "tests"]
+
+[tool.pytest.ini_options]
+addopts = [
+  "--strict-config",
+  "--strict-markers",
+  "--cov=cairnvm",
+  "--cov=cairnvm_launcher",
+  "--cov-branch",
+  "--cov-report=term-missing",
+  "--cov-fail-under=90",
+]
+pythonpath = ["."]
+testpaths = ["tests"]
+timeout = 10
+
+[tool.coverage.run]
+branch = true
+source = ["cairnvm", "cairnvm_launcher"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true

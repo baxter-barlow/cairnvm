@@ -1,0 +1,24 @@
+[build-system]
+requires = ["hatchling==1.32.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cairnvm-launcher"
+version = "0.1.0"
+description = "Independent trusted launcher boundary for CairnVM"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "LicenseRef-Proprietary"
+license-files = ["LICENSE"]
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/baxter-barlow/cairnvm"
+Documentation = "https://github.com/baxter-barlow/cairnvm/blob/main/Docs/Architecture-Spec.md"
+Security = "https://github.com/baxter-barlow/cairnvm/security/policy"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cairnvm_launcher"]
+
+[tool.hatch.build.targets.sdist]
+include = ["/src/cairnvm_launcher", "/LICENSE", "/README.md", "/pyproject.toml"]

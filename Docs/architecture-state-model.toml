@@ -1,0 +1,192 @@
+schema_version = 9
+normative_document = "Docs/Architecture-Spec.md"
+historical_document = "Docs/Architecture-Draft.md"
+invariants = [
+  "authenticate-before-semantic-use",
+  "bounds-before-allocation",
+  "no-silent-branch-or-rollback",
+  "trusted-freshness-or-refuse",
+  "single-writer-requires-fencing",
+  "no-destructive-remote-gc-v1",
+  "no-plaintext-remote-blocks-or-credentials",
+  "launcher-verifies-before-downloaded-execution",
+]
+implementation_status = [
+  { component = "CLI package and cairnvm entry point", status = "implemented-scaffold" },
+  { component = "Read-only preliminary doctor diagnostics", status = "implemented-scaffold" },
+  { component = "Independent launcher package boundary", status = "implemented-scaffold" },
+  { component = "Quality, artifact, and secret-scanning gates", status = "implemented-scaffold" },
+  { component = "Drive, cryptography, formats, and bootstrap", status = "not-implemented-phase-1" },
+  { component = "Internal block engine and offline checkpoints", status = "not-implemented-phase-2" },
+  { component = "Live checkpoints and internal backpressure", status = "not-implemented-phase-3" },
+  { component = "NBD, QEMU, supervision, and guest integration", status = "not-implemented-phase-4" },
+  { component = "Operational and privacy hardening", status = "not-implemented-phase-5" },
+]
+phase_ownership = [
+  { phase = 0, owns = "feasibility, scaffold boundaries, and honest evidence" },
+  { phase = 1, owns = "formats, cryptography, Drive, bootstrap, and provider primitives" },
+  { phase = 2, owns = "internal block requests, local durability, and offline checkpoint composition" },
+  { phase = 3, owns = "live checkpoints and internal backpressure admission, refusal, and status" },
+  { phase = 4, owns = "NBD wire and errors plus QEMU, supervisor, operator, and guest composition" },
+  { phase = 5, owns = "operational and privacy hardening" },
+]
+phase_gate = [
+  { phase = 0, criteria_ids = ["phase-0-colab-policy", "phase-0-colab-control-path", "phase-0-drive-synthetic-round-trip", "phase-0-oauth-authorization", "phase-0-oauth-refresh", "phase-0-runtime-memory-control", "phase-0-repository-geometry", "phase-0-recovery-runtime-loss", "phase-0-recovery-drive-trust", "phase-0-recovery-freshness-refusal", "phase-0-qemu-kvm-probe", "phase-0-qemu-tcg-probe", "phase-0-nbdkit-python-compatibility", "phase-0-security-gates", "phase-0-ci-required-checks", "phase-0-publication-controls", "phase-0-zero-negative-charter-review"] },
+  { phase = 1, criteria_ids = ["phase-1-reviewed-formats-crypto-drive-bootstrap-primitives", "phase-1-trusted-freshness-and-rollback-tests", "phase-1-finite-versioned-provider-inventory", "phase-1-provider-validation-evidence", "phase-1-independent-security-approval"] },
+  { phase = 2, criteria_ids = ["phase-2-reviewed-offline-block-contract", "phase-2-fencing-and-fresh-head", "phase-2-four-way-remote-composition", "phase-2-independent-recovery-approval"] },
+  { phase = 3, criteria_ids = ["phase-3-live-checkpoint-recovery", "phase-3-internal-backpressure-contract", "phase-3-live-fault-composition", "phase-3-independent-live-approval"] },
+  { phase = 4, criteria_ids = ["phase-4-reviewed-external-integration", "phase-4-nbd-wire-error-tests", "phase-4-qemu-supervisor-operator-guest-tests", "phase-4-independent-integration-approval"] },
+  { phase = 5, criteria_ids = ["phase-5-operational-privacy-hardening", "phase-5-recovery-drill-and-report-only-gc", "phase-5-independent-final-approval"] },
+]
+deferral_approval = [
+  { deferred_design_id = "phase-1-primitives", target_phase = 1, approval_criterion_id = "phase-1-independent-security-approval" },
+  { deferred_design_id = "phase-2-offline-block", target_phase = 2, approval_criterion_id = "phase-2-independent-recovery-approval" },
+  { deferred_design_id = "phase-3-live-checkpoints", target_phase = 3, approval_criterion_id = "phase-3-independent-live-approval" },
+  { deferred_design_id = "phase-4-external-integration", target_phase = 4, approval_criterion_id = "phase-4-independent-integration-approval" },
+  { deferred_design_id = "phase-5-operational-hardening", target_phase = 5, approval_criterion_id = "phase-5-independent-final-approval" },
+]
+
+[identity]
+accepted_adr = "Docs/ADRs/0001-cairnvm-identity.md"
+other_protocol_decisions = "deferred"
+surface = [
+  { name = "product", identifier = "CairnVM" },
+  { name = "repository", identifier = "baxter-barlow/cairnvm" },
+  { name = "runtime distribution", identifier = "cairnvm-runtime" },
+  { name = "launcher distribution", identifier = "cairnvm-launcher" },
+  { name = "runtime import", identifier = "cairnvm" },
+  { name = "launcher import", identifier = "cairnvm_launcher" },
+  { name = "command", identifier = "cairnvm" },
+  { name = "environment prefix", identifier = "CAIRNVM_" },
+  { name = "local state", identifier = ".cairnvm/" },
+  { name = "Colab state", identifier = "/content/cairnvm/" },
+  { name = "Drive root", identifier = "CairnVM/" },
+  { name = "metrics prefix", identifier = "cairnvm_" },
+  { name = "discovery MAC domain", identifier = 'ASCII("CAIR-DISCOVERY-v1\0")' },
+]
+magic_role = [
+  { magic = "CVIT", role = "intent" },
+  { magic = "CVMP", role = "mapping" },
+  { magic = "CVCH", role = "commit-header" },
+  { magic = "CVSE", role = "primary-secret-envelope" },
+  { magic = "CVRE", role = "recovery-envelope" },
+  { magic = "CVPK", role = "pack" },
+  { magic = "CVRC", role = "remote-record" },
+  { magic = "CVLR", role = "local-record" },
+  { magic = "CVKH", role = "key-handoff-frame" },
+]
+discovery_property_range = { namespace = "discovery-properties", first = "cair_d00", last = "cair_d29" }
+
+[durability]
+level = [
+  { name = "acknowledged", meaning = "accepted by the block engine; no restart-survival promise" },
+  { name = "local-durable", meaning = "survives a process restart only on the same runtime" },
+  { name = "published", meaning = "checkpoint creation returned success or was discovered remotely" },
+  { name = "reconciled", meaning = "authenticated provider objects and independently trusted freshness anchor both reconciled to checkpoint identity, parent, references, and required head relationship" },
+]
+
+[provider_inventory]
+status = "not-yet-approved"
+approved_schema_version = "none"
+contracts = []
+items = []
+contract_kinds = [
+  "provider-primitive",
+  "provider-operation",
+  "provider-assumption",
+  "provider-observable-branch",
+  "remote-mutation",
+  "provider-injected-fault",
+]
+contract_required_fields = [
+  "contract_id",
+  "kind",
+  "semantic_binding",
+  "implementation_test_traceability",
+]
+item_kinds = [
+  "documentation-and-bounds",
+  "deterministic-fake",
+  "live-disposable-account",
+  "remote-mutation-lost-response",
+]
+item_required_fields = [
+  "item_id",
+  "kind",
+  "covered_contract_ids",
+  "primary_documentation",
+  "applicability_and_bounds",
+  "deterministic_fake_cases",
+  "expected_outcomes",
+  "live_evidence",
+  "blocked_mapping",
+]
+coverage_rule = "reviewed-surface-contract-item-exact-bidirectional-no-omissions-or-unknown-bindings"
+remote_mutation_outcomes = ["absent", "present-as-intended", "conflicting", "indeterminate"]
+phase_zero_feasibility_probe_criteria = [
+  "phase-0-drive-synthetic-round-trip",
+  "phase-0-oauth-authorization",
+  "phase-0-oauth-refresh",
+  "phase-0-runtime-memory-control",
+  "phase-0-repository-geometry",
+]
+
+[evidence_policy]
+"gate result when a required runtime or service is unavailable" = "BLOCKED when no required check fails; never PASS"
+"publication sequence" = "tested implementation commit, then evidence/status commit"
+"evidence binding" = "full tested SHA and exact parent"
+"evaluation unit" = "one complete append-only Phase 0 TOML file"
+review = "manual independent exact-candidate review with no negative finding"
+"history claim" = "requires verified force-push and branch-deletion protection"
+
+[phase_result_accounting]
+outcomes = ["PASS", "FAIL", "BLOCKED"]
+criterion_result_identity = "criterion_id"
+evaluation_schema_version = 1
+evaluation_scope = "one complete append-only raw UTF-8 evaluation TOML bound to phase_id, tested_commit, exact_parent, publication_branch, grant lineage, and resource workload"
+representative_resource_workload = "one declared functional representative nonzero synthetic Drive-backed VM control-path workload with predeclared byte/object limits and one forced-over-limit nonzero exit per resource criterion"
+filename_pattern = "YYYYMMDDTHHMMSSZ-phase-0-evaluation.toml"
+latest_evaluation_selection = "lexicographically last complete evaluation after manual timestamp and externally supplied trusted-clock review; no evaluation after passed"
+max_evaluation_bytes = 65536
+evaluation_fields = [
+  "schema_version",
+  "phase_id",
+  "tested_commit",
+  "exact_parent",
+  "publication_branch",
+  "grant_lineage_id",
+  "resource_workload_id",
+  "tested_at_utc",
+  "commands",
+  "environment",
+  "synthetic_data",
+  "redactions",
+  "limitations",
+  "results",
+]
+result_fields = [
+  "criterion_id",
+  "outcome",
+  "evidence",
+  "limitation",
+  "shared_binding_id",
+]
+grant_lineage_criteria = [
+  "phase-0-drive-synthetic-round-trip",
+  "phase-0-oauth-authorization",
+  "phase-0-oauth-refresh",
+]
+resource_workload_criteria = [
+  "phase-0-runtime-memory-control",
+  "phase-0-repository-geometry",
+]
+criterion_outcome_rule = [
+  { condition = "any-required-check-fails", outcome = "FAIL" },
+  { condition = "any-required-check-blocked", outcome = "BLOCKED" },
+  { condition = "all-required-checks-pass", outcome = "PASS" },
+]
+aggregation_rule = [
+  { condition = "any-fail", status = "failed" },
+  { condition = "any-blocked", status = "blocked" },
+  { condition = "all-pass", status = "passed" },
+]

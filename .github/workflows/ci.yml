@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+          github-token: ""
+          python-version: ${{ matrix.python-version }}
+          version: "0.10.4"
+      - name: Install locked dependencies
+        run: uv sync --locked --all-groups --all-packages
+      - name: Lint
+        run: uv run --locked --all-packages ruff check . && uv run --locked --all-packages ruff format --check .
+      - name: Type-check
+        run: uv run --locked --all-packages mypy
+      - name: Test
+        run: uv run --locked --all-packages pytest
+      - name: Verify release artifacts
+        run: make verifier-coverage
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out complete history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+          github-token: ""
+          python-version: "3.12"
+          version: "0.10.4"
+      - name: Install locked dependencies
+        run: uv sync --locked --all-groups --all-packages
+      - name: Prove the pinned scanner and scan the tree
+        env:
+          CAIRNVM_SECRET_SCAN_SCOPE: history
+        run: env -u SKIP -u CAIRNVM_GITLEAKS_BOOTSTRAPPED CAIRNVM_SECRET_SCAN_SCOPE=history uv run --locked --all-packages python scripts/verify_secret_scanner.py
+
+  dependency-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+          github-token: ""
+          python-version: "3.12"
+          version: "0.10.4"
+      - name: Audit locked environment
+        run: uv run --locked --all-groups --all-packages pip-audit
