@@ -1495,22 +1495,14 @@ class SecretScannerCanaryTests(unittest.TestCase):
 
     def test_internal_download_entrypoint_is_fail_closed(self) -> None:
         self.assertEqual(2, scanner_module._internal_download_main([]))
-        asset = fixture_release_asset(build_release_archive())
-        with (
-            patch.object(scanner_module, "_select_release_asset", return_value=asset),
-            patch.object(scanner_module, "_download_release_archive_child") as download,
-        ):
+        asset = scanner_module.GITLEAKS_RELEASE_ASSETS[("linux", "x64")]
+        with patch.object(scanner_module, "_download_release_archive_child") as download:
             self.assertEqual(0, scanner_module._internal_download_main(["linux", "x64"]))
-        download.assert_called_once()
+        self.assertIs(asset, download.call_args.args[0])
 
-        with (
-            patch.object(
-                scanner_module,
-                "_select_release_asset",
-                side_effect=RuntimeError("unsupported"),
-            ),
-        ):
+        with patch.object(scanner_module, "_download_release_archive_child") as download:
             self.assertEqual(2, scanner_module._internal_download_main(["plan9", "mips"]))
+        download.assert_not_called()
 
     def test_archive_is_rehashed_each_run_and_persistent_binary_is_ignored(self) -> None:
         archive = build_release_archive()

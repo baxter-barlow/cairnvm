@@ -1316,7 +1316,9 @@ def _internal_download_main(arguments: list[str]) -> int:
     if len(arguments) != 2:
         return 2
     try:
-        asset = _select_release_asset(system=arguments[0], machine=arguments[1])
+        asset = GITLEAKS_RELEASE_ASSETS.get((arguments[0], arguments[1]))
+        if asset is None:
+            return 2
         _download_release_archive_child(
             asset,
             sys.stdout.buffer,
