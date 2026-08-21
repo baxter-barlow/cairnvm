@@ -1,23 +1,39 @@
 #!/usr/bin/env python3
-"""Scan exact Git trees with a pinned Gitleaks policy and generated canary."""
+"""Scan exact Git trees with a checksum-pinned Gitleaks release and generated canary.
+
+Benign concurrent cold starts are serialized. A hostile same-UID process that mutates the
+fixed cache namespace concurrently is outside this verifier's threat model.
+"""
 
 from __future__ import annotations
 
 import base64
+import fcntl
 import hashlib
 import os
+import platform
 import pwd
+import secrets
 import shutil
 import stat
+import struct
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import unicodedata
+import urllib.error
+import urllib.request
 import zipfile
+import zlib
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
+from http.client import HTTPMessage
 from pathlib import Path, PurePosixPath
-from typing import BinaryIO
+from typing import BinaryIO, cast
+from urllib.parse import urlsplit
 
 ARCHIVE_DEPTH = "1"
 DECODE_DEPTH = "1"
@@ -27,14 +43,73 @@ MAX_HISTORY_TREES = 4096
 MAX_TREE_ENTRIES = 100_000
 MAX_SNAPSHOT_BYTES = 256 * 1024 * 1024
 MAX_GIT_OUTPUT_BYTES = 64 * 1024 * 1024
-GITLEAKS_CONFIG_ENVIRONMENT = ("GITLEAKS_CONFIG", "GITLEAKS_CONFIG_TOML")
+MAX_RELEASE_ARCHIVE_BYTES = 16 * 1024 * 1024
+MAX_RELEASE_DECOMPRESSED_BYTES = 32 * 1024 * 1024
+MAX_GITLEAKS_BINARY_BYTES = 24 * 1024 * 1024
+RELEASE_DOWNLOAD_TIMEOUT_SECONDS = 60
+MAX_RELEASE_REDIRECTS = 3
+DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 GITLEAKS_POLICY = "[extend]\nuseDefault = true\n"
 REPOSITORY_CONTROL_FILES = frozenset((".gitleaks.toml", ".gitleaksignore"))
 REGULAR_FILE_MODES = frozenset(("100644", "100755"))
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
-PINNED_GITLEAKS_REVISION = "83d9cd684c87d95d656c1458ef04895a7f1cbd8e"
-PINNED_PRE_COMMIT_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve() / ".cache" / "pre-commit"
-BOOTSTRAP_ENVIRONMENT_VARIABLE = "CAIRNVM_GITLEAKS_BOOTSTRAPPED"
+GITLEAKS_VERSION = "8.30.1"
+GITLEAKS_RELEASE_BASE_URL = (
+    f"https://github.com/gitleaks/gitleaks/releases/download/v{GITLEAKS_VERSION}"
+)
+GITLEAKS_RELEASE_HOSTS = frozenset(("github.com", "release-assets.githubusercontent.com"))
+GITLEAKS_CACHE_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
+
+
+@dataclass(frozen=True)
+class ReleaseAsset:
+    filename: str
+    sha256: str
+    binary_size: int
+    archive_size: int
+    tar_size: int
+    binary_format: str
+    machine_code: int
+
+
+GITLEAKS_RELEASE_ASSETS = {
+    ("darwin", "arm64"): ReleaseAsset(
+        "gitleaks_8.30.1_darwin_arm64.tar.gz",
+        "b40ab0ae55c505963e365f271a8d3846efbc170aa17f2607f13df610a9aeb6a5",
+        21_324_882,
+        7_897_593,
+        21_359_616,
+        "macho",
+        0x0100000C,
+    ),
+    ("darwin", "x64"): ReleaseAsset(
+        "gitleaks_8.30.1_darwin_x64.tar.gz",
+        "dfe101a4db2255fc85120ac7f3d25e4342c3c20cf749f2c20a18081af1952709",
+        22_398_576,
+        8_359_235,
+        22_433_280,
+        "macho",
+        0x01000007,
+    ),
+    ("linux", "arm64"): ReleaseAsset(
+        "gitleaks_8.30.1_linux_arm64.tar.gz",
+        "e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080",
+        20_775_096,
+        7_601_421,
+        20_809_728,
+        "elf",
+        183,
+    ),
+    ("linux", "x64"): ReleaseAsset(
+        "gitleaks_8.30.1_linux_x64.tar.gz",
+        "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb",
+        21_958_840,
+        8_230_402,
+        21_993_472,
+        "elf",
+        62,
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -54,6 +129,29 @@ class TreeEntry:
     path: str
 
 
+def _select_release_asset(*, system: str | None = None, machine: str | None = None) -> ReleaseAsset:
+    operating_system = (platform.system() if system is None else system).lower()
+    architecture = (platform.machine() if machine is None else machine).lower()
+    normalized_architecture = {
+        "aarch64": "arm64",
+        "amd64": "x64",
+        "arm64": "arm64",
+        "x86_64": "x64",
+    }.get(architecture)
+    asset = GITLEAKS_RELEASE_ASSETS.get((operating_system, normalized_architecture or ""))
+    if asset is None:
+        raise RuntimeError("unsupported secret scanner platform")
+    return asset
+
+
+def _cache_root() -> Path:
+    return GITLEAKS_CACHE_HOME / ".cache" / "cairnvm" / "gitleaks" / f"v{GITLEAKS_VERSION}"
+
+
+def _cache_archive_path(asset: ReleaseAsset) -> Path:
+    return _cache_root() / asset.filename
+
+
 def build_canary() -> str:
     """Build a rule-matching token without storing one contiguously in the repository."""
 
@@ -61,118 +159,657 @@ def build_canary() -> str:
     return "".join(("gh", "p_", payload))
 
 
-def scanner_environment() -> dict[str, str]:
-    """Remove ambient Git and Gitleaks controls from scanner subprocesses."""
+def scanner_environment(isolated_home: Path) -> dict[str, str]:
+    """Create a minimal scanner environment without ambient executable controls."""
 
     return {
-        key: value
-        for key, value in os.environ.items()
-        if not key.startswith("GIT_") and key not in GITLEAKS_CONFIG_ENVIRONMENT
+        "HOME": str(isolated_home),
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PATH": os.defpath,
+        "TMPDIR": str(isolated_home),
+        "XDG_CONFIG_HOME": str(isolated_home),
     }
 
 
-def _bootstrap_environment() -> dict[str, str]:
-    blocked_names = {"SKIP", BOOTSTRAP_ENVIRONMENT_VARIABLE}
-    blocked_prefixes = ("GIT_", "GITLEAKS_", "PRE_COMMIT")
-    environment = {
-        key: value
-        for key, value in os.environ.items()
-        if key not in blocked_names and not key.startswith(blocked_prefixes)
-    }
-    environment["PRE_COMMIT_HOME"] = str(PINNED_PRE_COMMIT_HOME)
-    environment[BOOTSTRAP_ENVIRONMENT_VARIABLE] = "1"
-    return environment
-
-
-def _configured_gitleaks_pin_is_exact() -> bool:
+def _validate_release_url(url: str) -> None:
+    parsed = urlsplit(url)
     try:
-        configuration = (REPOSITORY_ROOT / ".pre-commit-config.yaml").read_text(encoding="utf-8")
-    except OSError:
-        return False
-    return (
-        "repo: https://github.com/gitleaks/gitleaks\n"
-        f"    rev: {PINNED_GITLEAKS_REVISION} # v8.30.1\n" in configuration
-    )
-
-
-def _resolve_pinned_scanner() -> str | None:
-    candidate = shutil.which("gitleaks")
-    if candidate is None:
-        return None
-    try:
-        scanner = Path(candidate).resolve(strict=True)
-        cache_root = PINNED_PRE_COMMIT_HOME.resolve(strict=True)
-        relative = scanner.relative_to(cache_root)
-    except (OSError, ValueError):
-        return None
+        port = parsed.port
+    except ValueError as error:
+        raise RuntimeError("unsafe secret scanner release URL") from error
     if (
-        len(relative.parts) != 4
-        or not relative.parts[0].startswith("repo")
-        or relative.parts[1:] != ("golangenv-default", "bin", "gitleaks")
-        or not scanner.is_file()
-        or not os.access(scanner, os.X_OK)
+        parsed.scheme != "https"
+        or parsed.hostname not in GITLEAKS_RELEASE_HOSTS
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in (None, 443)
+        or not parsed.path.startswith("/")
+        or parsed.fragment
     ):
-        return None
+        raise RuntimeError("unsafe secret scanner release URL")
 
-    repository = cache_root / relative.parts[0]
-    git = shutil.which("git")
-    if git is None:
-        return None
-    try:
-        git = str(Path(git).resolve(strict=True))
-        result = subprocess.run(  # noqa: S603  # Git is resolved without a shell.
-            [git, "--no-pager", "--no-replace-objects", "-C", str(repository), "rev-parse", "HEAD"],
-            check=False,
-            capture_output=True,
-            env=git_environment(PINNED_PRE_COMMIT_HOME),
-            timeout=GIT_COMMAND_TIMEOUT_SECONDS,
+
+class _ReleaseRedirectHandler(urllib.request.HTTPRedirectHandler):
+    max_redirections = MAX_RELEASE_REDIRECTS
+    max_repeats = MAX_RELEASE_REDIRECTS
+
+    def redirect_request(  # type: ignore[override]
+        self,
+        request: urllib.request.Request,
+        file_pointer: BinaryIO,
+        code: int,
+        message: str,
+        headers: HTTPMessage,
+        new_url: str,
+    ) -> urllib.request.Request | None:
+        _validate_release_url(new_url)
+        redirected = super().redirect_request(
+            request,
+            file_pointer,
+            code,
+            message,
+            headers,
+            new_url,
         )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if result.returncode != 0:
-        return None
-    try:
-        revision = result.stdout.decode("ascii").strip()
-    except UnicodeDecodeError:
-        return None
-    if revision != PINNED_GITLEAKS_REVISION:
-        return None
-    return str(scanner)
+        if redirected is not None:
+            for header in ("Authorization", "Cookie", "Proxy-Authorization"):
+                redirected.remove_header(header)
+        return redirected
 
 
-def _run_pinned_hook() -> int:
-    if not _configured_gitleaks_pin_is_exact():
-        return 2
-    uv = shutil.which("uv")
-    if uv is None:
-        return 2
+def _remaining_download_timeout(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise RuntimeError("secret scanner release download timed out")
+    return remaining
+
+
+def _copy_download(
+    source: BinaryIO,
+    destination: BinaryIO,
+    *,
+    deadline: float,
+) -> int:
+    total = 0
+    while True:
+        _remaining_download_timeout(deadline)
+        chunk = source.read(min(DOWNLOAD_CHUNK_BYTES, MAX_RELEASE_ARCHIVE_BYTES - total + 1))
+        if time.monotonic() > deadline:
+            raise RuntimeError("secret scanner release download timed out")
+        if not isinstance(chunk, bytes):
+            raise RuntimeError("secret scanner release download returned invalid bytes")
+        if not chunk:
+            return total
+        total += len(chunk)
+        if total > MAX_RELEASE_ARCHIVE_BYTES:
+            raise RuntimeError("secret scanner release archive exceeds the download limit")
+        destination.write(chunk)
+
+
+def _download_release_archive_child(
+    asset: ReleaseAsset,
+    destination: BinaryIO,
+    *,
+    deadline: float,
+) -> None:
+    url = f"{GITLEAKS_RELEASE_BASE_URL}/{asset.filename}"
+    _validate_release_url(url)
+    request = urllib.request.Request(  # noqa: S310  # URL was restricted to pinned HTTPS hosts.
+        url,
+        headers={"Accept": "application/octet-stream", "User-Agent": "CairnVM-secret-scanner/1"},
+        method="GET",
+    )
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        _ReleaseRedirectHandler(),
+        urllib.request.HTTPSHandler(),
+    )
     try:
-        uv = str(Path(uv).resolve(strict=True))
-        result = subprocess.run(  # noqa: S603  # uv is resolved without a shell.
-            [
-                uv,
-                "run",
-                "--locked",
-                "--all-packages",
-                "python",
-                "-m",
-                "pre_commit",
-                "run",
-                "--config",
-                str(REPOSITORY_ROOT / ".pre-commit-config.yaml"),
-                "gitleaks",
-                "--all-files",
-            ],
+        with opener.open(request, timeout=_remaining_download_timeout(deadline)) as response:
+            _validate_release_url(response.geturl())
+            if response.status != 200:
+                raise RuntimeError("secret scanner release download failed")
+            raw_length = response.headers.get("Content-Length")
+            if raw_length is not None:
+                try:
+                    content_length = int(raw_length)
+                except ValueError as error:
+                    raise RuntimeError(
+                        "secret scanner release returned an invalid length"
+                    ) from error
+                if content_length < 0 or content_length > MAX_RELEASE_ARCHIVE_BYTES:
+                    raise RuntimeError("secret scanner release archive exceeds the download limit")
+            downloaded = _copy_download(
+                cast(BinaryIO, response),
+                destination,
+                deadline=deadline,
+            )
+            if raw_length is not None and downloaded != content_length:
+                raise RuntimeError("secret scanner release length did not match its response")
+    except urllib.error.HTTPError as error:
+        raise RuntimeError("secret scanner release download failed") from error
+    except (OSError, urllib.error.URLError) as error:
+        raise RuntimeError("secret scanner release download could not complete") from error
+
+    destination.flush()
+
+
+def _download_release_archive(
+    asset: ReleaseAsset,
+    destination: BinaryIO,
+    *,
+    deadline: float,
+) -> None:
+    try:
+        asset_key = next(
+            key for key, candidate in GITLEAKS_RELEASE_ASSETS.items() if candidate == asset
+        )
+    except StopIteration as error:
+        raise RuntimeError("secret scanner release asset is unsupported") from error
+    command = [
+        sys.executable,
+        "-I",
+        str(Path(__file__).resolve()),
+        "--internal-download",
+        *asset_key,
+    ]
+    try:
+        result = subprocess.run(  # noqa: S603  # Runs this trusted script in isolated mode.
+            command,
             check=False,
-            cwd=REPOSITORY_ROOT,
-            env=_bootstrap_environment(),
+            close_fds=True,
+            env={"LANG": "C", "LC_ALL": "C", "PATH": os.defpath},
+            stdin=subprocess.DEVNULL,
+            stdout=destination,
             stderr=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            timeout=REPOSITORY_SCAN_TIMEOUT_SECONDS,
+            timeout=_remaining_download_timeout(deadline),
         )
-    except (OSError, subprocess.TimeoutExpired):
-        return 2
-    return result.returncode if result.returncode in (0, 1) else 2
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise RuntimeError("secret scanner release download could not complete") from error
+    if result.returncode != 0:
+        raise RuntimeError("secret scanner release download failed")
+    destination.flush()
+    destination.seek(0)
+    digest = hashlib.sha256()
+    while chunk := destination.read(DOWNLOAD_CHUNK_BYTES):
+        digest.update(chunk)
+    if digest.hexdigest() != asset.sha256:
+        raise RuntimeError("secret scanner release checksum did not match")
+
+
+def _validate_private_directory(metadata: os.stat_result, *, exact_mode: bool = False) -> None:
+    mode = stat.S_IMODE(metadata.st_mode)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or mode & 0o022
+        or (exact_mode and mode != 0o700)
+    ):
+        raise RuntimeError("secret scanner cache directory is unsafe")
+
+
+@contextmanager
+def _open_cache_directory() -> Iterator[tuple[int, Path]]:
+    home = GITLEAKS_CACHE_HOME
+    if not home.is_absolute():
+        raise RuntimeError("secret scanner cache home is unsafe")
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        directory_fd = os.open(home, flags)
+        _validate_private_directory(os.fstat(directory_fd))
+        for component in (".cache", "cairnvm", "gitleaks", f"v{GITLEAKS_VERSION}"):
+            with suppress(FileExistsError):
+                os.mkdir(component, mode=0o700, dir_fd=directory_fd)
+            next_fd = os.open(component, flags, dir_fd=directory_fd)
+            os.close(directory_fd)
+            directory_fd = next_fd
+            _validate_private_directory(
+                os.fstat(directory_fd),
+                exact_mode=component != ".cache",
+            )
+    except (OSError, RuntimeError) as error:
+        if "directory_fd" in locals():
+            os.close(directory_fd)
+        raise RuntimeError("secret scanner cache directory is unsafe") from error
+    try:
+        yield directory_fd, _cache_root()
+    finally:
+        os.close(directory_fd)
+
+
+def _validate_archive_metadata(metadata: os.stat_result, expected_size: int | None = None) -> None:
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+    ):
+        raise RuntimeError("secret scanner release archive is not a private regular file")
+    if metadata.st_size <= 0 or metadata.st_size > MAX_RELEASE_ARCHIVE_BYTES:
+        raise RuntimeError("secret scanner release archive exceeds the size limit")
+    if expected_size is not None and metadata.st_size != expected_size:
+        raise RuntimeError("secret scanner release archive size did not match")
+
+
+def _validate_lock_metadata(metadata: os.stat_result) -> None:
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+    ):
+        raise RuntimeError("secret scanner cache lock is unsafe")
+
+
+@contextmanager
+def _open_verified_archive_fd(
+    directory_fd: int,
+    filename: str,
+    expected_sha256: str,
+    *,
+    expected_size: int | None = None,
+) -> Iterator[BinaryIO]:
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        raw_fd = os.open(filename, flags, dir_fd=directory_fd)
+    except OSError as error:
+        raise RuntimeError("secret scanner release archive is unavailable") from error
+    try:
+        before = os.fstat(raw_fd)
+        _validate_archive_metadata(before, expected_size)
+    except Exception:
+        os.close(raw_fd)
+        raise
+    archive = os.fdopen(raw_fd, "rb")
+    try:
+        digest = hashlib.sha256()
+        while chunk := archive.read(DOWNLOAD_CHUNK_BYTES):
+            digest.update(chunk)
+        after = os.fstat(raw_fd)
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ) or digest.hexdigest() != expected_sha256:
+            raise RuntimeError("secret scanner release archive checksum did not match")
+        archive.seek(0)
+        yield archive
+    finally:
+        archive.close()
+
+
+@contextmanager
+def _open_verified_archive(
+    path: Path, expected_sha256: str, *, expected_size: int | None = None
+) -> Iterator[BinaryIO]:
+    try:
+        directory_fd = os.open(
+            path.parent,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except OSError as error:
+        raise RuntimeError("secret scanner release archive is unavailable") from error
+    try:
+        with _open_verified_archive_fd(
+            directory_fd,
+            path.name,
+            expected_sha256,
+            expected_size=expected_size,
+        ) as archive:
+            yield archive
+    finally:
+        os.close(directory_fd)
+
+
+def _ensure_cached_archive(asset: ReleaseAsset) -> Path:
+    deadline = time.monotonic() + RELEASE_DOWNLOAD_TIMEOUT_SECONDS
+    with _open_cache_directory() as (directory_fd, cache_root):
+        lock_name = ".download.lock"
+        lock_fd = os.open(
+            lock_name,
+            os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=directory_fd,
+        )
+        try:
+            _validate_lock_metadata(os.fstat(lock_fd))
+        except RuntimeError:
+            os.close(lock_fd)
+            raise
+        locked = False
+        try:
+            while True:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    locked = True
+                    break
+                except BlockingIOError as error:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise RuntimeError("secret scanner cache lock timed out") from error
+                    time.sleep(min(0.05, remaining))
+            try:
+                with _open_verified_archive_fd(
+                    directory_fd,
+                    asset.filename,
+                    asset.sha256,
+                    expected_size=asset.archive_size,
+                ):
+                    return cache_root / asset.filename
+            except RuntimeError as error:
+                try:
+                    os.stat(asset.filename, dir_fd=directory_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                else:
+                    raise error
+
+            temporary_name = f".{asset.filename}.{secrets.token_hex(12)}.partial"
+            temporary_fd = os.open(
+                temporary_name,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=directory_fd,
+            )
+            try:
+                with os.fdopen(os.dup(temporary_fd), "w+b") as destination:
+                    _download_release_archive(
+                        asset,
+                        destination,
+                        deadline=deadline,
+                    )
+                    destination.flush()
+                    os.fsync(destination.fileno())
+                os.lseek(temporary_fd, 0, os.SEEK_SET)
+                with os.fdopen(os.dup(temporary_fd), "rb") as downloaded:
+                    digest = hashlib.sha256()
+                    while chunk := downloaded.read(DOWNLOAD_CHUNK_BYTES):
+                        digest.update(chunk)
+                _validate_archive_metadata(os.fstat(temporary_fd), asset.archive_size)
+                if digest.hexdigest() != asset.sha256:
+                    raise RuntimeError("secret scanner release checksum did not match")
+                try:
+                    os.stat(asset.filename, dir_fd=directory_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    os.rename(
+                        temporary_name,
+                        asset.filename,
+                        src_dir_fd=directory_fd,
+                        dst_dir_fd=directory_fd,
+                    )
+                else:
+                    with _open_verified_archive_fd(
+                        directory_fd,
+                        asset.filename,
+                        asset.sha256,
+                        expected_size=asset.archive_size,
+                    ):
+                        pass
+                    os.unlink(temporary_name, dir_fd=directory_fd)
+                os.fsync(directory_fd)
+            except Exception:
+                with suppress(FileNotFoundError):
+                    os.unlink(temporary_name, dir_fd=directory_fd)
+                raise
+            finally:
+                os.close(temporary_fd)
+            return cache_root / asset.filename
+        finally:
+            if locked:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+
+
+def _decompress_release_archive(
+    archive: BinaryIO,
+    destination: BinaryIO,
+    asset: ReleaseAsset,
+) -> None:
+    decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    total = 0
+    reached_end = False
+    while chunk := archive.read(DOWNLOAD_CHUNK_BYTES):
+        pending = chunk
+        while pending:
+            remaining = MAX_RELEASE_DECOMPRESSED_BYTES - total
+            output = decompressor.decompress(pending, remaining + 1)
+            total += len(output)
+            if total > MAX_RELEASE_DECOMPRESSED_BYTES:
+                raise RuntimeError("invalid secret scanner archive")
+            destination.write(output)
+            pending = decompressor.unconsumed_tail
+            if decompressor.unused_data:
+                raise RuntimeError("invalid secret scanner archive")
+            if decompressor.eof:
+                reached_end = True
+                if pending or archive.read(1):
+                    raise RuntimeError("invalid secret scanner archive")
+                break
+            if not pending:
+                break
+        if reached_end:
+            break
+    if not reached_end:
+        raise RuntimeError("invalid secret scanner archive")
+    flushed = decompressor.flush()
+    total += len(flushed)
+    if total > MAX_RELEASE_DECOMPRESSED_BYTES:
+        raise RuntimeError("invalid secret scanner archive")
+    destination.write(flushed)
+    if total != asset.tar_size:
+        raise RuntimeError("invalid secret scanner archive")
+    destination.flush()
+    destination.seek(0)
+
+
+def _validate_binary_header(scanner: BinaryIO, asset: ReleaseAsset) -> None:
+    scanner.seek(0)
+    header = scanner.read(32)
+    if asset.binary_format == "macho":
+        if len(header) < 8 or header[:4] != b"\xcf\xfa\xed\xfe":
+            raise RuntimeError("invalid secret scanner archive")
+        machine_code = struct.unpack("<I", header[4:8])[0]
+    elif asset.binary_format == "elf":
+        if len(header) < 20 or header[:6] != b"\x7fELF\x02\x01":
+            raise RuntimeError("invalid secret scanner archive")
+        machine_code = struct.unpack("<H", header[18:20])[0]
+    else:
+        raise RuntimeError("invalid secret scanner archive")
+    if machine_code != asset.machine_code:
+        raise RuntimeError("invalid secret scanner archive")
+    scanner.seek(0)
+
+
+def _parse_tar_octal(field: bytes) -> int:
+    value = field.rstrip(b"\0 ").lstrip(b" ")
+    if not value or any(character not in b"01234567" for character in value):
+        raise RuntimeError("invalid secret scanner archive")
+    return int(value, 8)
+
+
+def _parse_tar_name(field: bytes) -> str:
+    if b"\0" in field:
+        visible, padding = field.split(b"\0", 1)
+        if any(padding):
+            raise RuntimeError("invalid secret scanner archive")
+    else:
+        visible = field
+    try:
+        return visible.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise RuntimeError("invalid secret scanner archive") from error
+
+
+def _validate_raw_tar(tar_stream: BinaryIO, asset: ReleaseAsset) -> None:
+    expected_inventory = (
+        ("LICENSE", 0o644, 1_069),
+        ("README.md", 0o644, 29_998),
+        ("gitleaks", 0o755, asset.binary_size),
+    )
+    inventory: list[tuple[str, int, int]] = []
+    collision_keys: set[str] = set()
+    tar_stream.seek(0)
+    while True:
+        header = tar_stream.read(512)
+        if len(header) != 512:
+            raise RuntimeError("invalid secret scanner archive")
+        if header == bytes(512):
+            if tar_stream.read(512) != bytes(512):
+                raise RuntimeError("invalid secret scanner archive")
+            if any(tar_stream.read()):
+                raise RuntimeError("invalid secret scanner archive")
+            break
+        if len(inventory) >= len(expected_inventory):
+            raise RuntimeError("invalid secret scanner archive")
+        stored_checksum = _parse_tar_octal(header[148:156])
+        checksum_header = header[:148] + (b" " * 8) + header[156:]
+        if sum(checksum_header) != stored_checksum:
+            raise RuntimeError("invalid secret scanner archive")
+        if header[257:263] != b"ustar\0" or header[263:265] != b"00":
+            raise RuntimeError("invalid secret scanner archive")
+        if header[156:157] not in (b"0", b"\0"):
+            raise RuntimeError("invalid secret scanner archive")
+        name = _parse_tar_name(header[:100])
+        prefix = _parse_tar_name(header[345:500])
+        if prefix:
+            name = f"{prefix}/{name}"
+        pure_name = PurePosixPath(name)
+        collision_key = unicodedata.normalize("NFC", name).casefold()
+        if (
+            not name
+            or name.startswith("/")
+            or "\\" in name
+            or any(part in ("", ".", "..") for part in pure_name.parts)
+            or collision_key in collision_keys
+        ):
+            raise RuntimeError("invalid secret scanner archive")
+        collision_keys.add(collision_key)
+        mode = _parse_tar_octal(header[100:108])
+        size = _parse_tar_octal(header[124:136])
+        if size > MAX_GITLEAKS_BINARY_BYTES:
+            raise RuntimeError("invalid secret scanner archive")
+        inventory.append((name, mode, size))
+        if len(tar_stream.read(size)) != size:
+            raise RuntimeError("invalid secret scanner archive")
+        padding_size = (-size) % 512
+        padding = tar_stream.read(padding_size)
+        if len(padding) != padding_size or any(padding):
+            raise RuntimeError("invalid secret scanner archive")
+    if tuple(inventory) != expected_inventory:
+        raise RuntimeError("invalid secret scanner archive")
+    tar_stream.seek(0)
+
+
+def _extract_scanner(archive: BinaryIO, destination: Path, asset: ReleaseAsset) -> Path:
+    expected_inventory = (
+        ("LICENSE", 0o644, 1_069),
+        ("README.md", 0o644, 29_998),
+        ("gitleaks", 0o755, asset.binary_size),
+    )
+    try:
+        with tempfile.TemporaryFile(mode="w+b", dir=destination) as tar_stream:
+            _decompress_release_archive(archive, tar_stream, asset)
+            _validate_raw_tar(tar_stream, asset)
+            with tarfile.open(fileobj=tar_stream, mode="r:") as release:
+                members = release.getmembers()
+                inventory = tuple(
+                    (member.name, member.mode, member.size)
+                    for member in members
+                    if member.type in (tarfile.REGTYPE, tarfile.AREGTYPE)
+                )
+                if (
+                    len(members) != len(expected_inventory)
+                    or inventory != expected_inventory
+                    or any(
+                        member.type not in (tarfile.REGTYPE, tarfile.AREGTYPE)
+                        or member.pax_headers
+                        or member.sparse is not None
+                        or member.linkname
+                        or member.name.startswith("/")
+                        or "\\" in member.name
+                        or any(part in ("", ".", "..") for part in PurePosixPath(member.name).parts)
+                        for member in members
+                    )
+                ):
+                    raise RuntimeError("invalid secret scanner archive")
+                scanner_member = members[2]
+                if scanner_member.size <= 0 or scanner_member.size > MAX_GITLEAKS_BINARY_BYTES:
+                    raise RuntimeError("invalid secret scanner archive")
+                source = release.extractfile(scanner_member)
+                if source is None:
+                    raise RuntimeError("invalid secret scanner archive")
+                scanner_path = destination / "gitleaks"
+                output_fd = os.open(
+                    scanner_path,
+                    os.O_RDWR
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | os.O_CLOEXEC
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    0o600,
+                )
+                with os.fdopen(output_fd, "w+b") as output:
+                    remaining = scanner_member.size
+                    while remaining:
+                        chunk = source.read(min(DOWNLOAD_CHUNK_BYTES, remaining))
+                        if not chunk:
+                            raise RuntimeError("invalid secret scanner archive")
+                        output.write(chunk)
+                        remaining -= len(chunk)
+                    if source.read(1):
+                        raise RuntimeError("invalid secret scanner archive")
+                    output.flush()
+                    os.fsync(output.fileno())
+                    _validate_binary_header(output, asset)
+                    os.fchmod(output.fileno(), 0o700)
+    except (OSError, EOFError, tarfile.TarError, zlib.error) as error:
+        raise RuntimeError("invalid secret scanner archive") from error
+    return scanner_path
+
+
+@contextmanager
+def _temporary_scanner(archive_path: Path, asset: ReleaseAsset) -> Iterator[Path]:
+    with tempfile.TemporaryDirectory(
+        prefix=".gitleaks-exec-",
+        dir=archive_path.parent,
+    ) as temporary:
+        destination = Path(temporary)
+        destination.chmod(0o700)
+        with _open_verified_archive(
+            archive_path,
+            asset.sha256,
+            expected_size=asset.archive_size,
+        ) as archive:
+            scanner = _extract_scanner(archive, destination, asset)
+        yield scanner.resolve(strict=True)
+
+
+@contextmanager
+def _temporary_cached_scanner(asset: ReleaseAsset) -> Iterator[Path]:
+    _ensure_cached_archive(asset)
+    with (
+        _open_cache_directory() as (directory_fd, cache_root),
+        tempfile.TemporaryDirectory(prefix=".gitleaks-exec-", dir=cache_root) as temporary,
+    ):
+        destination = Path(temporary)
+        _validate_private_directory(destination.stat(), exact_mode=True)
+        with _open_verified_archive_fd(
+            directory_fd,
+            asset.filename,
+            asset.sha256,
+            expected_size=asset.archive_size,
+        ) as archive:
+            scanner = _extract_scanner(archive, destination, asset)
+        yield scanner.resolve(strict=True)
 
 
 def git_environment(isolated_home: Path) -> dict[str, str]:
@@ -501,6 +1138,31 @@ def _captured_trees(repository: GitRepository, *, scope: str, deadline: float) -
     return trees
 
 
+def verify_version(scanner: str, isolated_home: Path) -> None:
+    """Require the checksum-pinned executable to identify the locked release."""
+
+    try:
+        result = subprocess.run(  # noqa: S603  # Scanner came from a verified release archive.
+            [scanner, "version"],
+            check=False,
+            close_fds=True,
+            env=scanner_environment(isolated_home),
+            stderr=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise RuntimeError("secret scanner version check could not complete") from error
+    if result.returncode != 0 or len(result.stdout) > 256:
+        raise RuntimeError("secret scanner version check failed")
+    try:
+        version = result.stdout.decode("ascii").strip()
+    except UnicodeDecodeError as error:
+        raise RuntimeError("secret scanner version check failed") from error
+    if version != GITLEAKS_VERSION:
+        raise RuntimeError("secret scanner version did not match the locked release")
+
+
 def verify_canary(scanner: str) -> None:
     """Require Gitleaks to report exactly one leak-style exit for a synthetic token."""
 
@@ -527,7 +1189,8 @@ def verify_canary(scanner: str) -> None:
                     str(source),
                 ],
                 check=False,
-                env=scanner_environment(),
+                close_fds=True,
+                env=scanner_environment(temporary_path),
                 stderr=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 timeout=30,
@@ -542,6 +1205,9 @@ def verify_canary(scanner: str) -> None:
 def _scan_snapshot(scanner: str, snapshot: Path, policy_directory: Path, *, deadline: float) -> int:
     policy = write_scanner_policy(policy_directory)
     disabled_ignore_path = policy_directory / "no-gitleaksignore"
+    scanner_home = policy_directory / "home"
+    scanner_home.mkdir(mode=0o700, exist_ok=True)
+    _validate_private_directory(scanner_home.stat(), exact_mode=True)
     timeout = _remaining_timeout(deadline, REPOSITORY_SCAN_TIMEOUT_SECONDS)
     command = [
         scanner,
@@ -566,7 +1232,8 @@ def _scan_snapshot(scanner: str, snapshot: Path, policy_directory: Path, *, dead
         result = subprocess.run(  # noqa: S603  # Scanner is resolved without a shell.
             command,
             check=False,
-            env=scanner_environment(),
+            close_fds=True,
+            env=scanner_environment(scanner_home),
             stderr=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             timeout=timeout,
@@ -630,24 +1297,37 @@ def scan_repository(scanner: str | Path, *, scope: str, repository: Path = REPOS
 def main() -> int:
     """Verify the scanner, then run the selected staged or history scope over exact trees."""
 
-    scanner = _resolve_pinned_scanner()
-    if scanner is None:
-        if os.environ.get(BOOTSTRAP_ENVIRONMENT_VARIABLE) == "1":
-            print("pinned secret scanner is unavailable", file=sys.stderr)
-            return 2
-        return _run_pinned_hook()
-
     try:
-        verify_canary(scanner)
-        return scan_repository(
-            scanner,
-            scope=os.environ.get("CAIRNVM_SECRET_SCAN_SCOPE", "staged"),
-            repository=REPOSITORY_ROOT,
-        )
+        asset = _select_release_asset()
+        with _temporary_cached_scanner(asset) as scanner:
+            verify_version(str(scanner), scanner.parent)
+            verify_canary(str(scanner))
+            return scan_repository(
+                scanner,
+                scope=os.environ.get("CAIRNVM_SECRET_SCAN_SCOPE", "staged"),
+                repository=REPOSITORY_ROOT,
+            )
     except (OSError, RuntimeError) as error:
         print(str(error), file=sys.stderr)
         return 2
 
 
+def _internal_download_main(arguments: list[str]) -> int:
+    if len(arguments) != 2:
+        return 2
+    try:
+        asset = _select_release_asset(system=arguments[0], machine=arguments[1])
+        _download_release_archive_child(
+            asset,
+            sys.stdout.buffer,
+            deadline=time.monotonic() + RELEASE_DOWNLOAD_TIMEOUT_SECONDS,
+        )
+    except (OSError, RuntimeError):
+        return 2
+    return 0
+
+
 if __name__ == "__main__":
+    if len(sys.argv) >= 2 and sys.argv[1] == "--internal-download":
+        raise SystemExit(_internal_download_main(sys.argv[2:]))
     raise SystemExit(main())
